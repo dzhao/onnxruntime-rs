@@ -371,6 +371,12 @@ impl<'a> Drop for Session<'a> {
 }
 
 impl<'a> Session<'a> {
+    pub fn ndarray2ptr<T, D>(&self, array: Array<T, D>) -> OrtTensor<T, D>
+    where T: TypeToTensorElementDataType + Debug + Clone,
+    D: ndarray::Dimension
+    {
+    OrtTensor::from_array(&self.memory_info, self.allocator_ptr, array).unwrap()
+    }
     /// Run the input data through the ONNX graph, performing inference.
     ///
     /// Note that ONNX models can have multiple inputs; a `Vec<_>` is thus
@@ -416,9 +422,9 @@ impl<'a> Session<'a> {
         let input_ort_tensors: Vec<OrtTensor<TIn, D>> = input_arrays
             .into_iter()
             .map(|input_array| {
-                OrtTensor::from_array(&self.memory_info, self.allocator_ptr, input_array)
+                OrtTensor::from_array(&self.memory_info, self.allocator_ptr, input_array).unwrap()
             })
-            .collect::<Result<Vec<OrtTensor<TIn, D>>>>()?;
+            .collect::<Vec<OrtTensor<TIn, D>>>();
         let input_ort_values: Vec<*const sys::OrtValue> = input_ort_tensors
             .iter()
             .map(|input_array_ort| input_array_ort.c_ptr as *const sys::OrtValue)
@@ -438,6 +444,208 @@ impl<'a> Session<'a> {
                 output_tensor_extractors_ptrs.as_mut_ptr(),
             )
         };
+        status_to_result(status).map_err(OrtError::Run)?;
+
+        let memory_info_ref = &self.memory_info;
+        let outputs: Result<Vec<OrtOwnedTensor<TOut, ndarray::Dim<ndarray::IxDynImpl>>>> =
+            output_tensor_extractors_ptrs
+                .into_iter()
+                .map(|ptr| {
+                    let mut tensor_info_ptr: *mut sys::OrtTensorTypeAndShapeInfo =
+                        std::ptr::null_mut();
+                    let status = unsafe {
+                        g_ort().GetTensorTypeAndShape.unwrap()(ptr, &mut tensor_info_ptr as _)
+                    };
+                    status_to_result(status).map_err(OrtError::GetTensorTypeAndShape)?;
+                    let dims = unsafe { get_tensor_dimensions(tensor_info_ptr) };
+                    unsafe { g_ort().ReleaseTensorTypeAndShapeInfo.unwrap()(tensor_info_ptr) };
+                    let dims: Vec<_> = dims?.iter().map(|&n| n as usize).collect();
+
+                    let mut output_tensor_extractor =
+                        OrtOwnedTensorExtractor::new(memory_info_ref, ndarray::IxDyn(&dims));
+                    output_tensor_extractor.tensor_ptr = ptr;
+                    output_tensor_extractor.extract::<TOut>()
+                })
+                .collect();
+
+        // Reconvert to CString so drop impl is called and memory is freed
+        let cstrings: Result<Vec<CString>> = input_names_ptr
+            .into_iter()
+            .map(|p| {
+                assert_not_null_pointer(p, "i8 for CString")?;
+                unsafe { Ok(CString::from_raw(p as *mut i8)) }
+            })
+            .collect();
+        cstrings?;
+
+        outputs
+    }
+    /// Run the input data through the ONNX graph, performing inference.
+    ///
+    /// Note that ONNX models can have multiple inputs; a `Vec<_>` is thus
+    /// used for the input data here.
+    pub fn run_different_types<'s, 't, 'm, TIn, TIn1, TOut, D>(
+        &'s mut self,
+        input_arrays: Vec<Array<TIn, D>>,
+        input_arrays1: Vec<Array<TIn1, D>>,
+    ) -> Result<Vec<OrtOwnedTensor<'t, 'm, TOut, ndarray::IxDyn>>>
+        where
+            TIn: TypeToTensorElementDataType + Debug + Clone,
+            TIn1: TypeToTensorElementDataType + Debug + Clone,
+            TOut: TypeToTensorElementDataType + Debug + Clone,
+            D: ndarray::Dimension,
+            'm: 't, // 'm outlives 't (memory info outlives tensor)
+            's: 'm, // 's outlives 'm (session outlives memory info)
+    {
+        // self.validate_input_shapes(&input_arrays)?;
+
+        // Build arguments to Run()
+
+        let input_names_ptr: Vec<*const i8> = self
+            .inputs
+            .iter()
+            .map(|input| input.name.clone())
+            .map(|n| CString::new(n).unwrap())
+            .map(|n| n.into_raw() as *const i8)
+            .collect();
+
+        let output_names_cstring: Vec<CString> = self
+            .outputs
+            .iter()
+            .map(|output| output.name.clone())
+            .map(|n| CString::new(n).unwrap())
+            .collect();
+        let output_names_ptr: Vec<*const i8> = output_names_cstring
+            .iter()
+            .map(|n| n.as_ptr() as *const i8)
+            .collect();
+
+        let mut output_tensor_extractors_ptrs: Vec<*mut sys::OrtValue> =
+            vec![std::ptr::null_mut(); self.outputs.len()];
+
+        // The C API expects pointers for the arrays (pointers to C-arrays)
+        let input_ort_tensors: Vec<OrtTensor<TIn, D>> = input_arrays
+            .into_iter()
+            .map(|input_array| {
+                OrtTensor::from_array(&self.memory_info, self.allocator_ptr, input_array).unwrap()
+            })
+            .collect::<Vec<OrtTensor<TIn, D>>>();
+        let input_ort_values: Vec<*const sys::OrtValue> = input_ort_tensors
+            .iter()
+            .map(|input_array_ort| input_array_ort.c_ptr as *const sys::OrtValue)
+            .collect();
+        let input_ort_tensors1: Vec<OrtTensor<TIn1, D>> = input_arrays1
+            .into_iter()
+            .map(|input_array| {
+                OrtTensor::from_array(&self.memory_info, self.allocator_ptr, input_array).unwrap()
+            })
+            .collect::<Vec<OrtTensor<TIn1, D>>>();
+        let input_ort_values1: Vec<*const sys::OrtValue> = input_ort_tensors1
+            .iter()
+            .map(|input_array_ort| input_array_ort.c_ptr as *const sys::OrtValue)
+            .collect();
+
+        let inputs = vec![input_ort_values[0], input_ort_values1[0], input_ort_values[1], input_ort_values[2], input_ort_values[3]];
+        let run_options_ptr: *const sys::OrtRunOptions = std::ptr::null();
+
+        let status = unsafe {
+            g_ort().Run.unwrap()(
+                self.session_ptr,
+                run_options_ptr,
+                input_names_ptr.as_ptr(),
+                inputs.as_ptr(),
+                inputs.len(),
+                output_names_ptr.as_ptr(),
+                output_names_ptr.len(),
+                output_tensor_extractors_ptrs.as_mut_ptr(),
+            )
+        };
+        status_to_result(status).map_err(OrtError::Run)?;
+
+        let memory_info_ref = &self.memory_info;
+        let outputs: Result<Vec<OrtOwnedTensor<TOut, ndarray::Dim<ndarray::IxDynImpl>>>> =
+            output_tensor_extractors_ptrs
+                .into_iter()
+                .map(|ptr| {
+                    let mut tensor_info_ptr: *mut sys::OrtTensorTypeAndShapeInfo =
+                        std::ptr::null_mut();
+                    let status = unsafe {
+                        g_ort().GetTensorTypeAndShape.unwrap()(ptr, &mut tensor_info_ptr as _)
+                    };
+                    status_to_result(status).map_err(OrtError::GetTensorTypeAndShape)?;
+                    let dims = unsafe { get_tensor_dimensions(tensor_info_ptr) };
+                    unsafe { g_ort().ReleaseTensorTypeAndShapeInfo.unwrap()(tensor_info_ptr) };
+                    let dims: Vec<_> = dims?.iter().map(|&n| n as usize).collect();
+
+                    let mut output_tensor_extractor =
+                        OrtOwnedTensorExtractor::new(memory_info_ref, ndarray::IxDyn(&dims));
+                    output_tensor_extractor.tensor_ptr = ptr;
+                    output_tensor_extractor.extract::<TOut>()
+                })
+                .collect();
+
+        // Reconvert to CString so drop impl is called and memory is freed
+        let cstrings: Result<Vec<CString>> = input_names_ptr
+            .into_iter()
+            .map(|p| {
+                assert_not_null_pointer(p, "i8 for CString")?;
+                unsafe { Ok(CString::from_raw(p as *mut i8)) }
+            })
+            .collect();
+        cstrings?;
+
+        outputs
+    }
+    pub fn run_generic<'s, 't, 'm, TOut>(
+        &'s mut self,
+        input_ort_values: Vec<*const sys::OrtValue>,
+    ) -> Result<Vec<OrtOwnedTensor<'t, 'm, TOut, ndarray::IxDyn>>>
+        where
+            TOut: TypeToTensorElementDataType + Debug + Clone,
+            'm: 't, // 'm outlives 't (memory info outlives tensor)
+            's: 'm, // 's outlives 'm (session outlives memory info)
+    {
+
+        // Build arguments to Run()
+
+        let input_names_ptr: Vec<*const i8> = self
+            .inputs
+            .iter()
+            .map(|input| input.name.clone())
+            .map(|n| CString::new(n).unwrap())
+            .map(|n| n.into_raw() as *const i8)
+            .collect();
+
+        let output_names_cstring: Vec<CString> = self
+            .outputs
+            .iter()
+            .map(|output| output.name.clone())
+            .map(|n| CString::new(n).unwrap())
+            .collect();
+        let output_names_ptr: Vec<*const i8> = output_names_cstring
+            .iter()
+            .map(|n| n.as_ptr() as *const i8)
+            .collect();
+
+        let mut output_tensor_extractors_ptrs: Vec<*mut sys::OrtValue> =
+            vec![std::ptr::null_mut(); self.outputs.len()];
+
+        let run_options_ptr: *const sys::OrtRunOptions = std::ptr::null();
+
+        println!("so far so good");
+        let status = unsafe {
+            g_ort().Run.unwrap()(
+                self.session_ptr,
+                run_options_ptr,
+                input_names_ptr.as_ptr(),
+                input_ort_values.as_ptr(),
+                input_ort_values.len(),
+                output_names_ptr.as_ptr(),
+                output_names_ptr.len(),
+                output_tensor_extractors_ptrs.as_mut_ptr(),
+            )
+        };
+        println!("finish running so good");
         status_to_result(status).map_err(OrtError::Run)?;
 
         let memory_info_ref = &self.memory_info;
