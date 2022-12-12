@@ -305,7 +305,8 @@ pub struct Session<'a> {
     /// Information about the ONNX's outputs as stored in loaded file
     pub outputs: Vec<Output>,
 }
-
+unsafe impl<'a> Send for Session<'a>{}
+unsafe impl<'a> Sync for Session<'a>{}
 /// Information about an ONNX's input as stored in loaded file
 #[derive(Debug)]
 pub struct Input {
@@ -485,7 +486,7 @@ impl<'a> Session<'a> {
     /// Note that ONNX models can have multiple inputs; a `Vec<_>` is thus
     /// used for the input data here.
     pub fn run_different_types<'s, 't, 'm, TIn, TIn1, TOut, D>(
-        &'s mut self,
+        &'s self,
         input_arrays: Vec<Array<TIn, D>>,
         input_arrays1: Vec<Array<TIn1, D>>,
     ) -> Result<Vec<OrtOwnedTensor<'t, 'm, TOut, ndarray::IxDyn>>>
