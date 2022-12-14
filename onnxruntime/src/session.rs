@@ -103,13 +103,24 @@ impl SessionBuilder {
     }
 
     /// Configure the session to use a number of threads
-    pub fn with_number_threads(self, num_threads: i16) -> Result<SessionBuilder> {
+    pub fn with_intra_op_num_threads(self, num_threads: i16) -> Result<SessionBuilder> {
         // FIXME: Pre-built binaries use OpenMP, set env variable instead
 
         // We use a u16 in the builder to cover the 16-bits positive values of a i32.
         let num_threads = num_threads as i32;
         let status =
             unsafe { g_ort().SetIntraOpNumThreads.unwrap()(self.session_options_ptr, num_threads) };
+        status_to_result(status).map_err(OrtError::SessionOptions)?;
+        assert_null_pointer(status, "SessionStatus")?;
+        Ok(self)
+    }
+    pub fn with_inter_op_num_threads(self, num_threads: i16) -> Result<SessionBuilder> {
+        // FIXME: Pre-built binaries use OpenMP, set env variable instead
+
+        // We use a u16 in the builder to cover the 16-bits positive values of a i32.
+        let num_threads = num_threads as i32;
+        let status =
+            unsafe { g_ort().SetInterOpNumThreads.unwrap()(self.session_options_ptr, num_threads) };
         status_to_result(status).map_err(OrtError::SessionOptions)?;
         assert_null_pointer(status, "SessionStatus")?;
         Ok(self)
