@@ -28,7 +28,7 @@ use crate::{
         ort_owned_tensor::{OrtOwnedTensor, OrtOwnedTensorExtractor},
         OrtTensor,
     },
-    AllocatorType, GraphOptimizationLevel, MemType, TensorElementDataType,
+    AllocatorType, GraphOptimizationLevel, MemType, TensorElementDataType, ExecutionMode,
     TypeToTensorElementDataType,
 };
 
@@ -112,6 +112,20 @@ impl SessionBuilder {
             unsafe { g_ort().SetIntraOpNumThreads.unwrap()(self.session_options_ptr, num_threads) };
         status_to_result(status).map_err(OrtError::SessionOptions)?;
         assert_null_pointer(status, "SessionStatus")?;
+        Ok(self)
+    }
+
+    pub fn with_execution_mode(
+        self,
+        execution_mode: ExecutionMode,
+    ) -> Result<SessionBuilder> {
+        // Sets graph optimization level
+        unsafe {
+            g_ort().SetSessionExecutionMode.unwrap()(
+                self.session_options_ptr,
+                execution_mode.into(),
+            )
+        };
         Ok(self)
     }
 
