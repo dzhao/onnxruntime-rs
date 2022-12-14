@@ -314,6 +314,27 @@ impl From<LoggingLevel> for sys::OrtLoggingLevel {
     }
 }
 
+
+/// ExecutionMode
+///
+/// See the [official documentation](https://github.com/microsoft/onnxruntime/blob/master/docs/ONNX_Runtime_Graph_Optimizations.md)
+#[derive(Debug)]
+#[cfg_attr(not(windows), repr(u32))]
+#[cfg_attr(windows, repr(i32))]
+pub enum ExecutionMode {
+    Sequential = sys::ExecutionMode::ORT_SEQUENTIAL as OnnxEnumInt,
+    /// Add optimization
+    Parallel = sys::ExecutionMode::ORT_PARALLEL as OnnxEnumInt,
+}
+impl From<ExecutionMode> for sys::ExecutionMode {
+    fn from(val: ExecutionMode) -> Self {
+        use ExecutionMode::*;
+        match val {
+            Parallel => sys::ExecutionMode::ORT_PARALLEL,
+            Sequential => sys::ExecutionMode::ORT_SEQUENTIAL
+        }
+    }
+}
 /// Optimization level performed by ONNX Runtime of the loaded graph
 ///
 /// See the [official documentation](https://github.com/microsoft/onnxruntime/blob/master/docs/ONNX_Runtime_Graph_Optimizations.md)
