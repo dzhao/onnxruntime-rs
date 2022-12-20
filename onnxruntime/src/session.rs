@@ -10,9 +10,11 @@ use std::os::windows::ffi::OsStrExt;
 #[cfg(feature = "model-fetching")]
 use std::env;
 
-use ndarray::Array;
+use ndarray::{Array, Ix2};
+use ndarray::Array2;
 use tracing::{debug, error};
-
+use std::fmt::Display;
+use std::fmt;
 use onnxruntime_sys as sys;
 
 use crate::{
@@ -34,7 +36,50 @@ use crate::{
 
 #[cfg(feature = "model-fetching")]
 use crate::{download::AvailableOnnxModel, error::OrtDownloadError};
+#[derive(Debug)]
+pub enum NdArrayEnum {
+    Float(Array2::<f64>),
+    Float32(Array2::<f32>),
+    Int(Array2::<i64>)
+}
 
+impl NdArrayEnum {
+    #[inline(always)]
+    fn create_ort_tensor_enum(self, session: &Session) -> OrtTensorEnum {
+        match self {
+            NdArrayEnum::Float(f64_array) => {
+                let sh = f64_array.shape();
+                let f32_array =
+                    Array2::from_shape_vec((sh[0], sh[1]), f64_array.into_iter().map(|f64| f64 as f32)
+                        .collect::<Vec<f32>>()).unwrap();
+                OrtTensorEnum::F32OrtTensor(OrtTensor::from_array(&session.memory_info, session.allocator_ptr, f32_array).unwrap())
+            },
+            NdArrayEnum::Float32(f32_array) => OrtTensorEnum::F32OrtTensor(OrtTensor::from_array(&session.memory_info, session.allocator_ptr, f32_array).unwrap()),
+            NdArrayEnum::Int(i64_array) => OrtTensorEnum::I64OrtTensor(OrtTensor::from_array(&session.memory_info, session.allocator_ptr, i64_array).unwrap()),
+        }
+    }
+}
+
+impl Display for NdArrayEnum {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "ND-Array: {:?}", self)
+    }
+}
+#[derive(Debug)]
+pub enum OrtTensorEnum<'a> {
+    F32OrtTensor(OrtTensor<'a, f32, Ix2>),
+    I64OrtTensor(OrtTensor<'a, i64, Ix2>)
+}
+impl<'a> OrtTensorEnum<'a> {
+    #[inline(always)]
+    fn c_ptr(&self) -> *const sys::OrtValue {
+        match self {
+            OrtTensorEnum::F32OrtTensor(t) => t.c_ptr as *const sys::OrtValue,
+            OrtTensorEnum::I64OrtTensor(t) => t.c_ptr as *const sys::OrtValue,
+        }
+    }
+
+}
 /// Type used to create a session using the _builder pattern_
 ///
 /// A `SessionBuilder` is created by calling the
@@ -581,6 +626,103 @@ impl Session {
                 input_names_ptr.as_ptr(),
                 inputs.as_ptr(),
                 inputs.len(),
+                output_names_ptr.as_ptr(),
+                output_names_ptr.len(),
+                output_tensor_extractors_ptrs.as_mut_ptr(),
+            )
+        };
+        status_to_result(status).map_err(OrtError::Run)?;
+
+        let memory_info_ref = &self.memory_info;
+        let outputs: Result<Vec<OrtOwnedTensor<TOut, ndarray::Dim<ndarray::IxDynImpl>>>> =
+            output_tensor_extractors_ptrs
+                .into_iter()
+                .map(|ptr| {
+                    let mut tensor_info_ptr: *mut sys::OrtTensorTypeAndShapeInfo =
+                        std::ptr::null_mut();
+                    let status = unsafe {
+                        g_ort().GetTensorTypeAndShape.unwrap()(ptr, &mut tensor_info_ptr as _)
+                    };
+                    status_to_result(status).map_err(OrtError::GetTensorTypeAndShape)?;
+                    let dims = unsafe { get_tensor_dimensions(tensor_info_ptr) };
+                    unsafe { g_ort().ReleaseTensorTypeAndShapeInfo.unwrap()(tensor_info_ptr) };
+                    let dims: Vec<_> = dims?.iter().map(|&n| n as usize).collect();
+
+                    let mut output_tensor_extractor =
+                        OrtOwnedTensorExtractor::new(memory_info_ref, ndarray::IxDyn(&dims));
+                    output_tensor_extractor.tensor_ptr = ptr;
+                    output_tensor_extractor.extract::<TOut>()
+                })
+                .collect();
+
+        // Reconvert to CString so drop impl is called and memory is freed
+        let cstrings: Result<Vec<CString>> = input_names_ptr
+            .into_iter()
+            .map(|p| {
+                assert_not_null_pointer(p, "i8 for CString")?;
+                unsafe { Ok(CString::from_raw(p as *mut i8)) }
+            })
+            .collect();
+        cstrings?;
+
+        outputs
+    }
+    pub fn run_ndarray<'s, 't, 'm, TOut >(
+        &'s self,
+        input_arrays: Vec<NdArrayEnum>
+    ) -> Result<Vec<OrtOwnedTensor<'t, 'm, TOut, ndarray::IxDyn>>>
+        where
+            TOut: TypeToTensorElementDataType + Debug + Clone,
+            'm: 't, // 'm outlives 't (memory info outlives tensor)
+            's: 'm, // 's outlives 'm (session outlives memory info)
+    {
+        // self.validate_input_shapes(&input_arrays)?;
+
+        // Build arguments to Run()
+
+        let input_names_ptr: Vec<*const i8> = self
+            .inputs
+            .iter()
+            .map(|input| input.name.clone())
+            .map(|n| CString::new(n).unwrap())
+            .map(|n| n.into_raw() as *const i8)
+            .collect();
+
+        let output_names_cstring: Vec<CString> = self
+            .outputs
+            .iter()
+            .map(|output| output.name.clone())
+            .map(|n| CString::new(n).unwrap())
+            .collect();
+        let output_names_ptr: Vec<*const i8> = output_names_cstring
+            .iter()
+            .map(|n| n.as_ptr() as *const i8)
+            .collect();
+
+        let mut output_tensor_extractors_ptrs: Vec<*mut sys::OrtValue> =
+            vec![std::ptr::null_mut(); self.outputs.len()];
+
+        // The C API expects pointers for the arrays (pointers to C-arrays)
+        let input_ort_tensors = input_arrays
+            .into_iter()
+            .map(|input_array| {
+                input_array.create_ort_tensor_enum(self)
+            })
+            .collect::<Vec<OrtTensorEnum>>();
+        let input_ort_values: Vec<*const sys::OrtValue> = input_ort_tensors
+            .iter()
+            .map(|input_array_ort| input_array_ort.c_ptr())
+            .collect();
+
+        let run_options_ptr: *const sys::OrtRunOptions = std::ptr::null();
+
+        let status = unsafe {
+            g_ort().Run.unwrap()(
+                self.session_ptr,
+                run_options_ptr,
+                input_names_ptr.as_ptr(),
+                input_ort_values.as_ptr(),
+                input_ort_values.len(),
                 output_names_ptr.as_ptr(),
                 output_names_ptr.len(),
                 output_tensor_extractors_ptrs.as_mut_ptr(),
